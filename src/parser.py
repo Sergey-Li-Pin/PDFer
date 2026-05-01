@@ -17,8 +17,8 @@ DEFAULT_FONT_PATH = os.path.join(
 class PDFProcessor:
     """
     Extract text blocks with coordinates and styles from PDF documents,
-    generate visual debug output, process translations, and fit translated
-    text to original bounding boxes via dynamic font scaling.
+    generate visual debug output, process translations, fit translated
+    text to original bounding boxes, and reconstruct the final PDF.
     """
 
     def __init__(self, file_path: str, font_path: str | None = None):
@@ -234,6 +234,84 @@ class PDFProcessor:
 
         return layout
 
+    def reconstruct_pdf(
+        self, layout: list[dict], output_path: str | None = None
+    ) -> str:
+        """
+        Generate the final translated PDF.
+
+        Steps:
+        1. Open a fresh copy of the original PDF.
+        2. Add redaction annotations for every original text span and apply
+           them to physically remove the old text layer.
+        3. Insert ``translated_text`` at ``origin`` with ``final_font_size``
+           using the configured TTF font.
+        4. Preserve original metadata and save.
+
+        Args:
+            layout: Layout list produced by ``process_translation``.
+            output_path: Destination file path.
+                         Defaults to ``output/translated_final.pdf``.
+
+        Returns:
+            Path to the reconstructed PDF.
+        """
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "output"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, "translated_final.pdf")
+
+        src_doc = self._open()
+        new_doc = fitz.open(self.file_path)
+
+        # Preserve metadata
+        new_doc.metadata = src_doc.metadata
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console,
+            transient=True,
+        ) as progress:
+            # 1. Mark original text spans for redaction
+            redact_task = progress.add_task(
+                "Marking original text for removal...", total=len(layout)
+            )
+            for span in layout:
+                page = new_doc[span["page"]]
+                page.add_redact_annot(fitz.Rect(span["bbox"]))
+                progress.advance(redact_task)
+
+            # 2. Apply redactions page by page
+            apply_task = progress.add_task(
+                "Applying redactions...", total=len(new_doc)
+            )
+            for page in new_doc:
+                page.apply_redactions()
+                progress.advance(apply_task)
+
+            # 3. Render translated text
+            render_task = progress.add_task(
+                "Rendering translated text...", total=len(layout)
+            )
+            for span in layout:
+                page = new_doc[span["page"]]
+                origin = span.get("origin", (span["bbox"][0], span["bbox"][3]))
+                page.insert_text(
+                    origin,
+                    span["translated_text"],
+                    fontsize=span["final_font_size"],
+                    color=(0, 0, 0),
+                    fontfile=self.font_path,
+                )
+                progress.advance(render_task)
+
+        new_doc.save(output_path)
+        new_doc.close()
+        return output_path
+
     def close(self) -> None:
         """Release any open resources."""
         if self._doc is not None:
@@ -253,7 +331,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="PDF-Master-Translate",
-        description="Extract, translate, and fit-to-box PDF text spans.",
+        description="Extract, translate, fit-to-box, and reconstruct PDF text spans.",
     )
     parser.add_argument("pdf_path", help="Path to the input PDF file.")
     parser.add_argument(
@@ -316,7 +394,13 @@ def main() -> None:
             )
         console.print(trans_table)
 
-    # 3. Generate debug visualization
+        # 3. Reconstruct the final translated PDF
+        final_pdf = processor.reconstruct_pdf(layout)
+        console.print(
+            f"[bold green]✓[/] Final translated PDF saved to: [cyan]{final_pdf}[/]"
+        )
+
+    # 4. Generate debug visualization
     debug_pdf = processor.visualize_layout(layout=layout)
     console.print(f"[bold green]✓[/] Debug PDF saved to: [cyan]{debug_pdf}[/]")
 
