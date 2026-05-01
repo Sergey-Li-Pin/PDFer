@@ -4,5 +4,6 @@ __pycache__/
 output/
 .env
 .obsidian/
+docs/
+PROMPT.md
 
-README.md
