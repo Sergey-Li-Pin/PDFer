@@ -1,3 +1,4 @@
 pymupdf
 rich
 python-dotenv
+googletrans==3.1.0a0
