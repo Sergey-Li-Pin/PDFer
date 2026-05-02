@@ -1,13 +1,54 @@
 import hashlib
 import json
 import os
+import threading
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from deep_translator import GoogleTranslator as DeepGoogleTranslator
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+
+
+class TranslationCache:
+    """Thread-safe JSON cache for translated strings."""
+
+    def __init__(self, cache_path: str):
+        self.cache_path = cache_path
+        self._cache: dict[str, str] = {}
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self) -> None:
+        if os.path.isfile(self.cache_path):
+            try:
+                with open(self.cache_path, "r", encoding="utf-8") as fh:
+                    self._cache = json.load(fh)
+            except (json.JSONDecodeError, OSError):
+                self._cache = {}
+        else:
+            self._cache = {}
+
+    def _save(self) -> None:
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        with open(self.cache_path, "w", encoding="utf-8") as fh:
+            json.dump(self._cache, fh, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _key(text: str, target_lang: str) -> str:
+        payload = f"{target_lang}::{text}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def get(self, text: str, target_lang: str) -> str | None:
+        with self._lock:
+            return self._cache.get(self._key(text, target_lang))
+
+    def set(self, text: str, target_lang: str, translated: str) -> None:
+        with self._lock:
+            self._cache[self._key(text, target_lang)] = translated
+            self._save()
 
 
 class BaseTranslator(ABC):
@@ -27,10 +68,53 @@ class BaseTranslator(ABC):
         """
         ...
 
+    def translate_batch(
+        self, texts: list[str], target_lang: str, threads: int = 4
+    ) -> dict[str, str]:
+        """
+        Translate a batch of strings in parallel.
+
+        Args:
+            texts: List of strings to translate.
+            target_lang: Target language code.
+            threads: Number of parallel workers.
+
+        Returns:
+            Mapping ``original_text -> translated_text``.
+        """
+        unique_texts = list(dict.fromkeys(t for t in texts if t and t.strip()))
+        results: dict[str, str] = {}
+        console = Console()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task(
+                "Parallel translation in progress...",
+                total=len(unique_texts),
+            )
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                futures = {
+                    executor.submit(self.translate, txt, target_lang): txt
+                    for txt in unique_texts
+                }
+                for future in as_completed(futures):
+                    txt = futures[future]
+                    try:
+                        results[txt] = future.result()
+                    except Exception:  # noqa: BLE001
+                        results[txt] = txt
+                    progress.advance(task)
+
+        return results
+
 
 class GoogleTranslator(BaseTranslator):
     """
-    Google Translate wrapper using ``deep-translator`` with local JSON caching.
+    Google Translate wrapper using ``deep-translator`` with thread-safe JSON caching.
     """
 
     def __init__(
@@ -39,71 +123,23 @@ class GoogleTranslator(BaseTranslator):
         max_retries: int = 3,
         retry_delay: float = 1.0,
     ):
-        """
-        Initialize the GoogleTranslator.
-
-        Args:
-            cache_path: Path to the JSON cache file. Defaults to
-                        ``output/translation_cache.json`` relative to project root.
-            max_retries: Maximum number of retries on network errors.
-            retry_delay: Initial delay between retries (doubles each retry).
-        """
-        self._console = Console()
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-
         if cache_path is None:
             root = Path(__file__).resolve().parent.parent
             cache_path = str(root / "output" / "translation_cache.json")
-        self.cache_path = cache_path
-        self._cache: dict[str, str] = {}
-        self._load_cache()
-
+        self._cache = TranslationCache(cache_path)
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         self._translator = DeepGoogleTranslator(source="auto", target="ru")
-
-    # ------------------------------------------------------------------ #
-    # Cache helpers
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _cache_key(text: str, target_lang: str) -> str:
-        """Return a stable hash key for the (text, lang) pair."""
-        payload = f"{target_lang}::{text}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def _load_cache(self) -> None:
-        if os.path.isfile(self.cache_path):
-            try:
-                with open(self.cache_path, "r", encoding="utf-8") as fh:
-                    self._cache = json.load(fh)
-            except (json.JSONDecodeError, OSError):
-                self._cache = {}
-        else:
-            self._cache = {}
-
-    def _save_cache(self) -> None:
-        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
-        with open(self.cache_path, "w", encoding="utf-8") as fh:
-            json.dump(self._cache, fh, ensure_ascii=False, indent=2)
-
-    # ------------------------------------------------------------------ #
-    # Translation
-    # ------------------------------------------------------------------ #
+        self._console = Console()
 
     def translate(self, text: str, target_lang: str) -> str:
-        """
-        Translate ``text`` to ``target_lang`` using Google Translate.
-
-        Checks the local cache first, then calls the API with retries.
-        """
         if not text or not text.strip():
             return text
 
-        key = self._cache_key(text, target_lang)
-        if key in self._cache:
-            return self._cache[key]
+        cached = self._cache.get(text, target_lang)
+        if cached is not None:
+            return cached
 
-        # deep-translator target is set at init, but we support dynamic lang
         if self._translator.target != target_lang:
             self._translator = DeepGoogleTranslator(source="auto", target=target_lang)
 
@@ -113,8 +149,7 @@ class GoogleTranslator(BaseTranslator):
         for attempt in range(1, self.max_retries + 1):
             try:
                 translated = self._translator.translate(text)
-                self._cache[key] = translated
-                self._save_cache()
+                self._cache.set(text, target_lang, translated)
                 return translated
             except Exception as exc:  # noqa: BLE001
                 last_exception = exc
@@ -129,60 +164,23 @@ class GoogleTranslator(BaseTranslator):
         )
         return text
 
-    def translate_batch(
-        self, texts: list[str], target_lang: str
-    ) -> dict[str, str]:
-        """
-        Translate a batch of unique strings efficiently.
-
-        Args:
-            texts: List of strings to translate.
-            target_lang: Target language code.
-
-        Returns:
-            Mapping ``original_text -> translated_text``.
-        """
-        unique_texts = list(dict.fromkeys(t for t in texts if t and t.strip()))
-        results: dict[str, str] = {}
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self._console,
-            transient=True,
-        ) as progress:
-            task = progress.add_task(
-                f"Translating {len(unique_texts)} unique spans...",
-                total=len(unique_texts),
-            )
-            for txt in unique_texts:
-                results[txt] = self.translate(txt, target_lang)
-                progress.advance(task)
-
-        return results
-
 
 class OllamaTranslator(BaseTranslator):
     """
     Local LLM translator using the official ``ollama`` Python library.
-    Falls back to the original text if Ollama is unreachable.
+    Adds a small intra-thread delay to reduce CPU thrashing.
     """
 
     def __init__(
         self,
         model: str = "llama3:8b",
         host: str = "http://localhost:11434",
+        intra_delay: float = 0.5,
     ):
-        """
-        Initialize the OllamaTranslator.
-
-        Args:
-            model: Model name to use (e.g. ``llama3:8b``, ``mistral``).
-            host: Ollama server host URL.
-        """
-        self._console = Console()
         self.model = model
         self.host = host
+        self.intra_delay = intra_delay
+        self._console = Console()
         try:
             from ollama import Client
             self._client = Client(host=host)
@@ -192,18 +190,11 @@ class OllamaTranslator(BaseTranslator):
             ) from exc
 
     def translate(self, text: str, target_lang: str) -> str:
-        """
-        Translate ``text`` using the local Ollama LLM.
-
-        Args:
-            text: Text to translate.
-            target_lang: Target language name or code.
-
-        Returns:
-            Translated text, or the original text on failure.
-        """
         if not text or not text.strip():
             return text
+
+        # Small stagger to prevent CPU thrashing when many threads hit Ollama
+        time.sleep(self.intra_delay)
 
         prompt = (
             "You are a professional book translator. "
@@ -229,35 +220,3 @@ class OllamaTranslator(BaseTranslator):
                 f"Falling back to original text.[/yellow]"
             )
             return text
-
-    def translate_batch(
-        self, texts: list[str], target_lang: str
-    ) -> dict[str, str]:
-        """
-        Translate a batch of strings via Ollama (one-by-one).
-
-        Args:
-            texts: List of strings to translate.
-            target_lang: Target language code.
-
-        Returns:
-            Mapping ``original_text -> translated_text``.
-        """
-        unique_texts = list(dict.fromkeys(t for t in texts if t and t.strip()))
-        results: dict[str, str] = {}
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self._console,
-            transient=True,
-        ) as progress:
-            task = progress.add_task(
-                f"Translating {len(unique_texts)} paragraphs via Ollama...",
-                total=len(unique_texts),
-            )
-            for txt in unique_texts:
-                results[txt] = self.translate(txt, target_lang)
-                progress.advance(task)
-
-        return results

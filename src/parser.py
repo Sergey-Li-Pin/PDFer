@@ -252,6 +252,7 @@ class PDFProcessor:
         translator: BaseTranslator,
         target_lang: str,
         font_manager: FontManager | None = None,
+        threads: int = 4,
     ) -> list[dict]:
         """
         Translate text in paragraph mode, map words back to original spans,
@@ -287,7 +288,9 @@ class PDFProcessor:
             f"[bold cyan]Translating {len(paragraph_texts)} paragraphs to '{target_lang}'...[/bold cyan]"
         )
 
-        translations = translator.translate_batch(paragraph_texts, target_lang)
+        translations = translator.translate_batch(
+            paragraph_texts, target_lang, threads=threads
+        )
 
         # Map translated text back to individual spans
         for key, para_text in zip(block_keys, paragraph_texts):
@@ -447,7 +450,17 @@ def main() -> None:
         default=None,
         help="Path to font_map.json (default: project root font_map.json).",
     )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=4,
+        help="Number of parallel translation workers (default: 4, max: 16).",
+    )
     args = parser.parse_args()
+    if args.threads < 1:
+        args.threads = 1
+    elif args.threads > 16:
+        args.threads = 16
 
     if not os.path.isfile(args.pdf_path):
         console.print(f"[bold red]Error:[/] File not found: {args.pdf_path}")
@@ -491,7 +504,9 @@ def main() -> None:
         for style, path in report.items():
             console.print(f"  {style}: [green]{os.path.basename(path)}[/]")
 
-        layout = processor.process_translation(translator, args.lang, font_manager)
+        layout = processor.process_translation(
+            translator, args.lang, font_manager, threads=args.threads
+        )
 
         trans_table = Table(title=f"Translations & Scaling (target: {args.lang})")
         trans_table.add_column("Original", style="white", no_wrap=False)
