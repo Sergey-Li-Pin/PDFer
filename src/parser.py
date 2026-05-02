@@ -288,8 +288,15 @@ class PDFProcessor:
             f"[bold cyan]Translating {len(paragraph_texts)} paragraphs to '{target_lang}'...[/bold cyan]"
         )
 
+        # Ollama local LLMs struggle with parallel generation on CPU,
+        # so we force sequential processing for that engine.
+        if isinstance(translator, OllamaTranslator):
+            batch_threads = 1
+        else:
+            batch_threads = threads
+
         translations = translator.translate_batch(
-            paragraph_texts, target_lang, threads=threads
+            paragraph_texts, target_lang, threads=batch_threads
         )
 
         # Map translated text back to individual spans

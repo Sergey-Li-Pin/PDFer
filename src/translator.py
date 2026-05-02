@@ -169,6 +169,7 @@ class OllamaTranslator(BaseTranslator):
     """
     Local LLM translator using the official ``ollama`` Python library.
     Adds a small intra-thread delay to reduce CPU thrashing.
+    Uses thread-safe JSON caching and disables system proxy trust.
     """
 
     def __init__(
@@ -176,14 +177,19 @@ class OllamaTranslator(BaseTranslator):
         model: str = "llama3:8b",
         host: str = "http://localhost:11434",
         intra_delay: float = 0.5,
+        cache_path: str | None = None,
     ):
         self.model = model
         self.host = host
         self.intra_delay = intra_delay
         self._console = Console()
+        if cache_path is None:
+            root = Path(__file__).resolve().parent.parent
+            cache_path = str(root / "output" / "translation_cache.json")
+        self._cache = TranslationCache(cache_path)
         try:
             from ollama import Client
-            self._client = Client(host=host)
+            self._client = Client(host=host, trust_env=False)
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
                 "ollama package is required. Install it: pip install ollama"
@@ -193,13 +199,17 @@ class OllamaTranslator(BaseTranslator):
         if not text or not text.strip():
             return text
 
+        cached = self._cache.get(text, target_lang)
+        if cached is not None:
+            return cached
+
         # Small stagger to prevent CPU thrashing when many threads hit Ollama
         time.sleep(self.intra_delay)
 
         prompt = (
-            "You are a professional book translator. "
-            f"Translate this text to {target_lang}. "
-            "Tone: Literary, magical, suitable for children. "
+            "You are a professional universal translator. "
+            f"Translate the following text to {target_lang}. "
+            "Preserve formatting, tone, and nuances. "
             "Return ONLY the translation."
             f"\n\n{text}"
         )
@@ -213,7 +223,10 @@ class OllamaTranslator(BaseTranslator):
             translated = response.get("response", "").strip()
             if translated.startswith('"') and translated.endswith('"'):
                 translated = translated[1:-1]
-            return translated if translated else text
+            if translated:
+                self._cache.set(text, target_lang, translated)
+                return translated
+            return text
         except Exception as exc:  # noqa: BLE001
             self._console.print(
                 f"[yellow]⚠ Ollama request failed ({exc}). "
