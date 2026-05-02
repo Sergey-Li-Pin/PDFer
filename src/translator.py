@@ -5,6 +5,7 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from deep_translator import GoogleTranslator as DeepGoogleTranslator
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
@@ -29,7 +30,7 @@ class BaseTranslator(ABC):
 
 class GoogleTranslator(BaseTranslator):
     """
-    Google Translate wrapper with local JSON caching and retry logic.
+    Google Translate wrapper using ``deep-translator`` with local JSON caching.
     """
 
     def __init__(
@@ -58,31 +59,7 @@ class GoogleTranslator(BaseTranslator):
         self._cache: dict[str, str] = {}
         self._load_cache()
 
-        # Lazy import so the module can be imported even when googletrans is absent.
-        try:
-            from googletrans import Translator
-        except ImportError as exc:  # pragma: no cover
-            raise ImportError(
-                "googletrans is required for GoogleTranslator. "
-                "Install it: pip install googletrans==3.1.0a0"
-            ) from exc
-
-        # googletrans uses an old httpx that chokes on SOCKS proxies in env vars.
-        # We temporarily hide proxy env variables while instantiating the client.
-        _proxy_vars = (
-            "HTTP_PROXY", "http_proxy",
-            "HTTPS_PROXY", "https_proxy",
-            "ALL_PROXY", "all_proxy",
-        )
-        _stashed = {}
-        for var in _proxy_vars:
-            if var in os.environ:
-                _stashed[var] = os.environ.pop(var)
-        try:
-            self._translator = Translator()
-        finally:
-            for var, val in _stashed.items():
-                os.environ[var] = val
+        self._translator = DeepGoogleTranslator(source="auto", target="ru")
 
     # ------------------------------------------------------------------ #
     # Cache helpers
@@ -126,13 +103,16 @@ class GoogleTranslator(BaseTranslator):
         if key in self._cache:
             return self._cache[key]
 
+        # deep-translator target is set at init, but we support dynamic lang
+        if self._translator.target != target_lang:
+            self._translator = DeepGoogleTranslator(source="auto", target=target_lang)
+
         last_exception: Exception | None = None
         delay = self.retry_delay
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                result = self._translator.translate(text, dest=target_lang)
-                translated = result.text if result else text
+                translated = self._translator.translate(text)
                 self._cache[key] = translated
                 self._save_cache()
                 return translated
@@ -143,7 +123,6 @@ class GoogleTranslator(BaseTranslator):
                     delay *= 2
                 continue
 
-        # All retries exhausted — gracefully fall back to original text.
         self._console.print(
             f"[yellow]⚠ Translation failed after {self.max_retries} attempts. "
             f"Falling back to original text.[/yellow]"
@@ -174,6 +153,107 @@ class GoogleTranslator(BaseTranslator):
         ) as progress:
             task = progress.add_task(
                 f"Translating {len(unique_texts)} unique spans...",
+                total=len(unique_texts),
+            )
+            for txt in unique_texts:
+                results[txt] = self.translate(txt, target_lang)
+                progress.advance(task)
+
+        return results
+
+
+class OllamaTranslator(BaseTranslator):
+    """
+    Local LLM translator using the official ``ollama`` Python library.
+    Falls back to the original text if Ollama is unreachable.
+    """
+
+    def __init__(
+        self,
+        model: str = "llama3:8b",
+        host: str = "http://localhost:11434",
+    ):
+        """
+        Initialize the OllamaTranslator.
+
+        Args:
+            model: Model name to use (e.g. ``llama3:8b``, ``mistral``).
+            host: Ollama server host URL.
+        """
+        self._console = Console()
+        self.model = model
+        self.host = host
+        try:
+            from ollama import Client
+            self._client = Client(host=host)
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "ollama package is required. Install it: pip install ollama"
+            ) from exc
+
+    def translate(self, text: str, target_lang: str) -> str:
+        """
+        Translate ``text`` using the local Ollama LLM.
+
+        Args:
+            text: Text to translate.
+            target_lang: Target language name or code.
+
+        Returns:
+            Translated text, or the original text on failure.
+        """
+        if not text or not text.strip():
+            return text
+
+        prompt = (
+            "You are a professional book translator. "
+            f"Translate this text to {target_lang}. "
+            "Tone: Literary, magical, suitable for children. "
+            "Return ONLY the translation."
+            f"\n\n{text}"
+        )
+
+        try:
+            response = self._client.generate(
+                model=self.model,
+                prompt=prompt,
+                stream=False,
+            )
+            translated = response.get("response", "").strip()
+            if translated.startswith('"') and translated.endswith('"'):
+                translated = translated[1:-1]
+            return translated if translated else text
+        except Exception as exc:  # noqa: BLE001
+            self._console.print(
+                f"[yellow]⚠ Ollama request failed ({exc}). "
+                f"Falling back to original text.[/yellow]"
+            )
+            return text
+
+    def translate_batch(
+        self, texts: list[str], target_lang: str
+    ) -> dict[str, str]:
+        """
+        Translate a batch of strings via Ollama (one-by-one).
+
+        Args:
+            texts: List of strings to translate.
+            target_lang: Target language code.
+
+        Returns:
+            Mapping ``original_text -> translated_text``.
+        """
+        unique_texts = list(dict.fromkeys(t for t in texts if t and t.strip()))
+        results: dict[str, str] = {}
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self._console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task(
+                f"Translating {len(unique_texts)} paragraphs via Ollama...",
                 total=len(unique_texts),
             )
             for txt in unique_texts:

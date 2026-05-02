@@ -1,13 +1,15 @@
 import argparse
 import os
 import sys
+from collections import defaultdict
 
 import fitz
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
-from translator import BaseTranslator, GoogleTranslator
+from font_manager import FontManager
+from translator import BaseTranslator, GoogleTranslator, OllamaTranslator
 
 DEFAULT_FONT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "assets", "fonts", "DejaVuSans.ttf"
@@ -32,6 +34,7 @@ class PDFProcessor:
         """
         self.file_path = file_path
         self.font_path = font_path or DEFAULT_FONT_PATH
+        self.font_path_abs = os.path.abspath(self.font_path)
         self.console = Console()
         self._doc: fitz.Document | None = None
         self._font: fitz.Font | None = None
@@ -42,11 +45,11 @@ class PDFProcessor:
             self._doc = fitz.open(self.file_path)
         return self._doc
 
-    def _get_font(self) -> fitz.Font:
-        """Lazy-load the external TTF font for width calculations."""
-        if self._font is None:
-            self._font = fitz.Font(fontfile=self.font_path)
-        return self._font
+    def _get_font(self, font_path: str | None = None) -> fitz.Font:
+        """Lazy-load an external TTF font for width calculations."""
+        path = font_path or self.font_path_abs
+        # Simple cache-per-path could be added, but for now we create fresh
+        return fitz.Font(fontfile=path)
 
     def extract_text(self) -> str:
         """
@@ -75,6 +78,7 @@ class PDFProcessor:
         Returns:
             A list of dictionaries, each containing:
             - page: page number (0-based)
+            - block: block index within the page
             - text: the span text
             - bbox: bounding box as a tuple (x0, y0, x1, y1)
             - font_size: font size
@@ -95,7 +99,7 @@ class PDFProcessor:
             )
             for page_num, page in enumerate(doc):
                 page_dict = page.get_text("dict")
-                for block in page_dict.get("blocks", []):
+                for block_idx, block in enumerate(page_dict.get("blocks", [])):
                     if "lines" not in block:
                         continue
                     for line in block["lines"]:
@@ -103,6 +107,7 @@ class PDFProcessor:
                             spans.append(
                                 {
                                     "page": page_num,
+                                    "block": block_idx,
                                     "text": span.get("text", ""),
                                     "bbox": tuple(span["bbox"]),
                                     "font_size": span.get("size", 0.0),
@@ -113,8 +118,44 @@ class PDFProcessor:
 
         return spans
 
+    @staticmethod
+    def _distribute_text(text: str, weights: list[float]) -> list[str]:
+        """
+        Split ``text`` into pieces proportionally to ``weights``.
+
+        Args:
+            text: The full translated paragraph.
+            weights: Relative weights (e.g. original span text lengths).
+
+        Returns:
+            List of text fragments matching the length of ``weights``.
+        """
+        words = text.split()
+        if not words or sum(weights) == 0:
+            return [text] + [""] * (len(weights) - 1)
+
+        total_weight = sum(weights)
+        counts = []
+        allocated = 0
+        for i, w in enumerate(weights[:-1]):
+            n = round(len(words) * w / total_weight)
+            counts.append(max(0, n))
+            allocated += n
+        counts.append(max(0, len(words) - allocated))
+
+        result = []
+        idx = 0
+        for c in counts:
+            result.append(" ".join(words[idx : idx + c]))
+            idx += c
+        return result
+
     def calculate_optimal_font_size(
-        self, text: str, target_width: float, original_font_size: float
+        self,
+        text: str,
+        target_width: float,
+        original_font_size: float,
+        font_path: str | None = None,
     ) -> float:
         """
         Dynamically reduce font size until ``text`` fits inside ``target_width``.
@@ -123,12 +164,13 @@ class PDFProcessor:
             text: The (translated) text to measure.
             target_width: Available width in points (bbox width).
             original_font_size: Starting font size.
+            font_path: Optional TTF path override.
 
         Returns:
             The largest font size ≤ ``original_font_size`` that fits,
             or ``6.0`` as a hard floor.
         """
-        font = self._get_font()
+        font = self._get_font(font_path)
         font_size = original_font_size
         MIN_SIZE = 6.0
 
@@ -141,17 +183,22 @@ class PDFProcessor:
         return max(font_size, MIN_SIZE)
 
     def visualize_layout(
-        self, output_path: str | None = None, layout: list[dict] | None = None
+        self,
+        output_path: str | None = None,
+        layout: list[dict] | None = None,
+        target_lang: str | None = None,
     ) -> str:
         """
         Create a copy of the PDF with red rectangles around every text span.
         If ``layout`` contains translated text and ``final_font_size``,
-        ghost-prints the translated string inside the box in blue.
+        ghost-prints the translated string inside the box in blue using
+        ``fitz.TextWriter`` for reliable font embedding.
 
         Args:
             output_path: Destination file path. Defaults to ``output/debug_layout.pdf``.
             layout: Pre-computed layout list (e.g. from ``process_translation``).
                     If ``None``, ``extract_layout()`` is called.
+            target_lang: Target language code; forces DejaVuSans for ``'ru'``.
 
         Returns:
             The path to the generated debug PDF.
@@ -184,13 +231,16 @@ class PDFProcessor:
 
                 if "translated_text" in span and "final_font_size" in span:
                     origin = span.get("origin", (span["bbox"][0], span["bbox"][3]))
-                    page.insert_text(
+                    font_path = span.get("mapped_font_path", self.font_path_abs)
+                    font = fitz.Font(fontfile=font_path)
+                    tw = fitz.TextWriter(page.rect)
+                    tw.append(
                         origin,
                         span["translated_text"],
+                        font=font,
                         fontsize=span["final_font_size"],
-                        color=(0, 0, 1),
-                        fontfile=self.font_path,
                     )
+                    tw.write_text(page, color=(0, 0, 1), render_mode=0)
                 progress.advance(task)
 
         debug_doc.save(output_path)
@@ -198,44 +248,77 @@ class PDFProcessor:
         return output_path
 
     def process_translation(
-        self, translator: BaseTranslator, target_lang: str
+        self,
+        translator: BaseTranslator,
+        target_lang: str,
+        font_manager: FontManager | None = None,
     ) -> list[dict]:
         """
-        Translate each unique text span, compute ``final_font_size`` so the
-        translated string fits the original bbox, and attach the results.
+        Translate text in paragraph mode, map words back to original spans,
+        compute ``final_font_size``, and attach font mapping.
 
         Args:
             translator: An instance of a ``BaseTranslator`` subclass.
             target_lang: Target language code (e.g. 'ru', 'en').
+            font_manager: Optional ``FontManager`` for style-aware fonts.
 
         Returns:
             The layout list with added fields:
-            ``translated_text``, ``final_font_size``, and ``origin``.
+            ``translated_text``, ``final_font_size``, ``origin``, and
+            ``mapped_font_path``.
         """
         layout = self.extract_layout()
-        unique_texts = list({span["text"] for span in layout if span["text"].strip()})
+
+        # Group spans by (page, block) to form paragraphs
+        blocks = defaultdict(list)
+        for span in layout:
+            blocks[(span["page"], span["block"])].append(span)
+
+        # Build paragraph texts
+        paragraph_texts = []
+        block_keys = []
+        for key in sorted(blocks.keys()):
+            spans = blocks[key]
+            para_text = " ".join(s["text"] for s in spans)
+            paragraph_texts.append(para_text)
+            block_keys.append(key)
 
         self.console.print(
-            f"[bold cyan]Translating {len(unique_texts)} unique strings to '{target_lang}'...[/bold cyan]"
+            f"[bold cyan]Translating {len(paragraph_texts)} paragraphs to '{target_lang}'...[/bold cyan]"
         )
 
-        translations = translator.translate_batch(unique_texts, target_lang)
+        translations = translator.translate_batch(paragraph_texts, target_lang)
 
-        for span in layout:
-            original = span["text"]
-            translated = translations.get(original, original)
-            span["translated_text"] = translated
+        # Map translated text back to individual spans
+        for key, para_text in zip(block_keys, paragraph_texts):
+            spans = blocks[key]
+            translated_para = translations.get(para_text, para_text)
 
-            target_width = span["bbox"][2] - span["bbox"][0]
-            span["final_font_size"] = self.calculate_optimal_font_size(
-                translated, target_width, span["font_size"]
-            )
-            span["origin"] = (span["bbox"][0], span["bbox"][3])
+            weights = [len(s["text"]) for s in spans]
+            distributed = self._distribute_text(translated_para, weights)
+
+            for span, translated_text in zip(spans, distributed):
+                span["translated_text"] = translated_text
+
+                target_width = span["bbox"][2] - span["bbox"][0]
+                mapped_font = (
+                    font_manager.get_font_path(span["font_name"])
+                    if font_manager
+                    else self.font_path_abs
+                )
+                span["mapped_font_path"] = mapped_font
+                span["final_font_size"] = self.calculate_optimal_font_size(
+                    translated_text, target_width, span["font_size"], mapped_font
+                )
+                span["origin"] = (span["bbox"][0], span["bbox"][3])
 
         return layout
 
     def reconstruct_pdf(
-        self, layout: list[dict], output_path: str | None = None
+        self,
+        layout: list[dict],
+        output_path: str | None = None,
+        target_lang: str | None = None,
     ) -> str:
         """
         Generate the final translated PDF.
@@ -243,15 +326,17 @@ class PDFProcessor:
         Steps:
         1. Open a fresh copy of the original PDF.
         2. Add redaction annotations for every original text span and apply
-           them to physically remove the old text layer.
-        3. Insert ``translated_text`` at ``origin`` with ``final_font_size``
-           using the configured TTF font.
+           them (with ``PDF_REDACT_IMAGE_NONE``) to clear text without
+           touching images.
+        3. Render ``translated_text`` via ``fitz.TextWriter`` for reliable
+           font embedding, using per-span mapped fonts.
         4. Preserve original metadata and save.
 
         Args:
             layout: Layout list produced by ``process_translation``.
             output_path: Destination file path.
                          Defaults to ``output/translated_final.pdf``.
+            target_lang: Target language code; forces DejaVuSans for ``'ru'``.
 
         Returns:
             Path to the reconstructed PDF.
@@ -262,6 +347,10 @@ class PDFProcessor:
             )
             os.makedirs(output_dir, exist_ok=True)
             output_path = os.path.join(output_dir, "translated_final.pdf")
+
+        self.console.print(
+            f"[bold cyan]Using font:[/] {self.font_path_abs}"
+        )
 
         src_doc = self._open()
         new_doc = fitz.open(self.file_path)
@@ -284,28 +373,31 @@ class PDFProcessor:
                 page.add_redact_annot(fitz.Rect(span["bbox"]))
                 progress.advance(redact_task)
 
-            # 2. Apply redactions page by page
+            # 2. Apply redactions page by page (keep images intact)
             apply_task = progress.add_task(
                 "Applying redactions...", total=len(new_doc)
             )
             for page in new_doc:
-                page.apply_redactions()
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
                 progress.advance(apply_task)
 
-            # 3. Render translated text
+            # 3. Render translated text with TextWriter for correct embedding
             render_task = progress.add_task(
                 "Rendering translated text...", total=len(layout)
             )
             for span in layout:
                 page = new_doc[span["page"]]
                 origin = span.get("origin", (span["bbox"][0], span["bbox"][3]))
-                page.insert_text(
+                font_path = span.get("mapped_font_path", self.font_path_abs)
+                font = fitz.Font(fontfile=font_path)
+                tw = fitz.TextWriter(page.rect)
+                tw.append(
                     origin,
                     span["translated_text"],
+                    font=font,
                     fontsize=span["final_font_size"],
-                    color=(0, 0, 0),
-                    fontfile=self.font_path,
                 )
+                tw.write_text(page, color=(0, 0, 0), render_mode=0)
                 progress.advance(render_task)
 
         new_doc.save(output_path)
@@ -344,6 +436,17 @@ def main() -> None:
         default="ru",
         help="Target language code for translation (default: ru).",
     )
+    parser.add_argument(
+        "--engine",
+        default="google",
+        choices=["google", "ollama"],
+        help="Translation engine to use (default: google).",
+    )
+    parser.add_argument(
+        "--font-config",
+        default=None,
+        help="Path to font_map.json (default: project root font_map.json).",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.pdf_path):
@@ -377,31 +480,43 @@ def main() -> None:
 
     # 2. Optional translation + font scaling
     if args.translate:
-        translator = GoogleTranslator()
-        layout = processor.process_translation(translator, args.lang)
+        if args.engine == "ollama":
+            translator = OllamaTranslator()
+        else:
+            translator = GoogleTranslator()
+
+        font_manager = FontManager(args.font_config)
+        report = font_manager.style_report()
+        console.print("[bold cyan]Font mapping:[/]")
+        for style, path in report.items():
+            console.print(f"  {style}: [green]{os.path.basename(path)}[/]")
+
+        layout = processor.process_translation(translator, args.lang, font_manager)
 
         trans_table = Table(title=f"Translations & Scaling (target: {args.lang})")
         trans_table.add_column("Original", style="white", no_wrap=False)
         trans_table.add_column("Translated", style="cyan", no_wrap=False)
         trans_table.add_column("Orig Size", justify="right", style="yellow")
         trans_table.add_column("Final Size", justify="right", style="green")
+        trans_table.add_column("Mapped Font", style="magenta")
         for span in layout[:10]:
             trans_table.add_row(
-                span["text"][:50],
-                span.get("translated_text", "")[:50],
+                span["text"][:40],
+                span.get("translated_text", "")[:40],
                 f"{span['font_size']:.1f}",
                 f"{span.get('final_font_size', span['font_size']):.1f}",
+                os.path.basename(span.get("mapped_font_path", "")),
             )
         console.print(trans_table)
 
         # 3. Reconstruct the final translated PDF
-        final_pdf = processor.reconstruct_pdf(layout)
+        final_pdf = processor.reconstruct_pdf(layout, target_lang=args.lang)
         console.print(
             f"[bold green]✓[/] Final translated PDF saved to: [cyan]{final_pdf}[/]"
         )
 
     # 4. Generate debug visualization
-    debug_pdf = processor.visualize_layout(layout=layout)
+    debug_pdf = processor.visualize_layout(layout=layout, target_lang=args.lang)
     console.print(f"[bold green]✓[/] Debug PDF saved to: [cyan]{debug_pdf}[/]")
 
     processor.close()
