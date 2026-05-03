@@ -1,6 +1,10 @@
+import os
+
+for var in ["all_proxy", "ALL_PROXY", "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"]:
+    os.environ.pop(var, None)
+
 import hashlib
 import json
-import os
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -195,7 +199,9 @@ class OllamaTranslator(BaseTranslator):
                 "ollama package is required. Install it: pip install ollama"
             ) from exc
 
-    def translate(self, text: str, target_lang: str) -> str:
+    def translate(
+        self, text: str, target_lang: str, draft_text: str | None = None
+    ) -> str:
         if not text or not text.strip():
             return text
 
@@ -206,13 +212,23 @@ class OllamaTranslator(BaseTranslator):
         # Small stagger to prevent CPU thrashing when many threads hit Ollama
         time.sleep(self.intra_delay)
 
-        prompt = (
-            "You are a professional universal translator. "
-            f"Translate the following text to {target_lang}. "
-            "Preserve formatting, tone, and nuances. "
-            "Return ONLY the translation."
-            f"\n\n{text}"
-        )
+        if draft_text:
+            prompt = (
+                f"I have a draft translation: '{draft_text}'. "
+                f"The original text was: '{text}'. "
+                f"Rewrite this into high-quality, natural {target_lang}. "
+                "IMPORTANT: The result must be roughly the same length as the original "
+                "to fit in a PDF box. "
+                "Return ONLY the polished translation."
+            )
+        else:
+            prompt = (
+                "You are a professional universal translator. "
+                f"Translate the following text to {target_lang}. "
+                "Preserve formatting, tone, and nuances. "
+                "Return ONLY the translation."
+                f"\n\n{text}"
+            )
 
         try:
             response = self._client.generate(

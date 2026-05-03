@@ -253,6 +253,7 @@ class PDFProcessor:
         target_lang: str,
         font_manager: FontManager | None = None,
         threads: int = 4,
+        hybrid: bool = False,
     ) -> list[dict]:
         """
         Translate text in paragraph mode, map words back to original spans,
@@ -288,16 +289,50 @@ class PDFProcessor:
             f"[bold cyan]Translating {len(paragraph_texts)} paragraphs to '{target_lang}'...[/bold cyan]"
         )
 
-        # Ollama local LLMs struggle with parallel generation on CPU,
-        # so we force sequential processing for that engine.
-        if isinstance(translator, OllamaTranslator):
-            batch_threads = 1
-        else:
-            batch_threads = threads
+        if hybrid:
+            # Stage 1: Google draft (parallel)
+            self.console.print(
+                "[bold cyan]Stage 1: Generating Google draft translations...[/bold cyan]"
+            )
+            google_translator = GoogleTranslator()
+            draft_results = google_translator.translate_batch(
+                paragraph_texts, target_lang, threads=threads
+            )
 
-        translations = translator.translate_batch(
-            paragraph_texts, target_lang, threads=batch_threads
-        )
+            # Stage 2: Ollama polish (sequential)
+            self.console.print(
+                "[bold cyan]Stage 2: Polishing translations with Ollama...[/bold cyan]"
+            )
+            polished_results: dict[str, str] = {}
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=self.console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task(
+                    "Polishing translations...", total=len(paragraph_texts)
+                )
+                for para_text in paragraph_texts:
+                    draft = draft_results.get(para_text, para_text)
+                    polished = translator.translate(
+                        para_text, target_lang, draft_text=draft
+                    )
+                    polished_results[para_text] = polished
+                    progress.advance(task)
+
+            translations = polished_results
+        else:
+            # Ollama local LLMs struggle with parallel generation on CPU,
+            # so we force sequential processing for that engine.
+            if isinstance(translator, OllamaTranslator):
+                batch_threads = 1
+            else:
+                batch_threads = threads
+
+            translations = translator.translate_batch(
+                paragraph_texts, target_lang, threads=batch_threads
+            )
 
         # Map translated text back to individual spans
         for key, para_text in zip(block_keys, paragraph_texts):
@@ -463,6 +498,14 @@ def main() -> None:
         default=4,
         help="Number of parallel translation workers (default: 4, max: 16).",
     )
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help=(
+            "Enable two-stage hybrid translation: Google draft + Ollama polish. "
+            "Requires --engine ollama."
+        ),
+    )
     args = parser.parse_args()
     if args.threads < 1:
         args.threads = 1
@@ -500,7 +543,9 @@ def main() -> None:
 
     # 2. Optional translation + font scaling
     if args.translate:
-        if args.engine == "ollama":
+        if args.hybrid:
+            translator = OllamaTranslator()
+        elif args.engine == "ollama":
             translator = OllamaTranslator()
         else:
             translator = GoogleTranslator()
@@ -512,7 +557,11 @@ def main() -> None:
             console.print(f"  {style}: [green]{os.path.basename(path)}[/]")
 
         layout = processor.process_translation(
-            translator, args.lang, font_manager, threads=args.threads
+            translator,
+            args.lang,
+            font_manager,
+            threads=args.threads,
+            hybrid=args.hybrid,
         )
 
         trans_table = Table(title=f"Translations & Scaling (target: {args.lang})")
