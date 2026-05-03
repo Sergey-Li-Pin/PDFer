@@ -7,3 +7,4 @@ output/
 docs/
 PROMPT.md
 font_map.json
+.env

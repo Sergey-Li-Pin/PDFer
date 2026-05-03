@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz
 from rich.console import Console
@@ -9,7 +10,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from font_manager import FontManager
-from translator import BaseTranslator, GoogleTranslator, OllamaTranslator
+from translator import BaseTranslator, GoogleTranslator, OllamaTranslator, OpenRouterTranslator
 
 DEFAULT_FONT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "assets", "fonts", "DejaVuSans.ttf"
@@ -299,29 +300,63 @@ class PDFProcessor:
                 paragraph_texts, target_lang, threads=threads
             )
 
-            # Stage 2: Ollama polish (sequential)
-            self.console.print(
-                "[bold cyan]Stage 2: Polishing translations with Ollama...[/bold cyan]"
-            )
-            polished_results: dict[str, str] = {}
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=self.console,
-                transient=True,
-            ) as progress:
-                task = progress.add_task(
-                    "Polishing translations...", total=len(paragraph_texts)
+            # Stage 2: LLM polish
+            if isinstance(translator, OllamaTranslator):
+                self.console.print(
+                    "[bold cyan]Stage 2: Polishing translations with Ollama (sequential)...[/bold cyan]"
                 )
-                for para_text in paragraph_texts:
-                    draft = draft_results.get(para_text, para_text)
-                    polished = translator.translate(
-                        para_text, target_lang, draft_text=draft
+                polished_results: dict[str, str] = {}
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    console=self.console,
+                    transient=True,
+                ) as progress:
+                    task = progress.add_task(
+                        "Polishing translations...", total=len(paragraph_texts)
                     )
-                    polished_results[para_text] = polished
-                    progress.advance(task)
-
-            translations = polished_results
+                    for para_text in paragraph_texts:
+                        draft = draft_results.get(para_text, para_text)
+                        polished = translator.translate(
+                            para_text, target_lang, draft_text=draft
+                        )
+                        polished_results[para_text] = polished
+                        progress.advance(task)
+                translations = polished_results
+            else:
+                # OpenRouter and other cloud APIs can handle parallel requests
+                self.console.print(
+                    "[bold cyan]Stage 2: Polishing translations with OpenRouter (parallel)...[/bold cyan]"
+                )
+                polished_results = {}
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    console=self.console,
+                    transient=True,
+                ) as progress:
+                    task = progress.add_task(
+                        "Polishing translations...", total=len(paragraph_texts)
+                    )
+                    with ThreadPoolExecutor(max_workers=threads) as executor:
+                        futures = {
+                            executor.submit(
+                                translator.translate,
+                                para_text,
+                                target_lang,
+                                draft_results.get(para_text, para_text),
+                            ): para_text
+                            for para_text in paragraph_texts
+                        }
+                        for future in as_completed(futures):
+                            para_text = futures[future]
+                            try:
+                                polished = future.result()
+                            except Exception:  # noqa: BLE001
+                                polished = draft_results.get(para_text, para_text)
+                            polished_results[para_text] = polished
+                            progress.advance(task)
+                translations = polished_results
         else:
             # Ollama local LLMs struggle with parallel generation on CPU,
             # so we force sequential processing for that engine.
@@ -484,7 +519,7 @@ def main() -> None:
     parser.add_argument(
         "--engine",
         default="google",
-        choices=["google", "ollama"],
+        choices=["google", "ollama", "openrouter"],
         help="Translation engine to use (default: google).",
     )
     parser.add_argument(
@@ -502,8 +537,8 @@ def main() -> None:
         "--hybrid",
         action="store_true",
         help=(
-            "Enable two-stage hybrid translation: Google draft + Ollama polish. "
-            "Requires --engine ollama."
+            "Enable two-stage hybrid translation: Google draft + LLM polish. "
+            "Uses Ollama when --engine ollama, otherwise OpenRouter."
         ),
     )
     args = parser.parse_args()
@@ -544,9 +579,14 @@ def main() -> None:
     # 2. Optional translation + font scaling
     if args.translate:
         if args.hybrid:
-            translator = OllamaTranslator()
+            if args.engine == "ollama":
+                translator = OllamaTranslator()
+            else:
+                translator = OpenRouterTranslator()
         elif args.engine == "ollama":
             translator = OllamaTranslator()
+        elif args.engine == "openrouter":
+            translator = OpenRouterTranslator()
         else:
             translator = GoogleTranslator()
 

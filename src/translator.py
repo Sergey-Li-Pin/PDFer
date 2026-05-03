@@ -7,13 +7,18 @@ import hashlib
 import json
 import threading
 import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from deep_translator import GoogleTranslator as DeepGoogleTranslator
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+
+load_dotenv()
 
 
 class TranslationCache:
@@ -246,6 +251,102 @@ class OllamaTranslator(BaseTranslator):
         except Exception as exc:  # noqa: BLE001
             self._console.print(
                 f"[yellow]⚠ Ollama request failed ({exc}). "
+                f"Falling back to original text.[/yellow]"
+            )
+            return text
+
+
+class OpenRouterTranslator(BaseTranslator):
+    """
+    Cloud LLM translator using the OpenRouter API.
+    Uses thread-safe JSON caching and clean HTTPS requests (no proxy).
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        cache_path: str | None = None,
+    ):
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
+        self.model = model or os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+        self.endpoint = "https://openrouter.ai/api/v1/chat/completions"
+        self._console = Console()
+        if cache_path is None:
+            root = Path(__file__).resolve().parent.parent
+            cache_path = str(root / "output" / "translation_cache.json")
+        self._cache = TranslationCache(cache_path)
+        if not self.api_key:
+            self._console.print(
+                "[yellow]⚠ OPENROUTER_API_KEY not found. "
+                "Set it in .env or pass it directly.[/yellow]"
+            )
+
+    def translate(
+        self, text: str, target_lang: str, draft_text: str | None = None
+    ) -> str:
+        if not text or not text.strip():
+            return text
+
+        cached = self._cache.get(text, target_lang)
+        if cached is not None:
+            return cached
+
+        if draft_text:
+            prompt = (
+                f"You are a professional translator. I have a draft: '{draft_text}'. "
+                f"The original: '{text}'. "
+                f"Rewrite it into natural, high-quality {target_lang}. "
+                "Keep it roughly the same length. "
+                "Return ONLY the translation."
+            )
+        else:
+            prompt = (
+                "You are a professional universal translator. "
+                f"Translate the following text to {target_lang}. "
+                "Preserve formatting, tone, and nuances. "
+                "Return ONLY the translation."
+                f"\n\n{text}"
+            )
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://pdf-master-translate.local",
+            "X-Title": "PDF Master Translate",
+        }
+
+        payload = json.dumps({
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            self.endpoint,
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                translated = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+                if translated.startswith('"') and translated.endswith('"'):
+                    translated = translated[1:-1]
+                if translated:
+                    self._cache.set(text, target_lang, translated)
+                    return translated
+                return text
+        except Exception as exc:  # noqa: BLE001
+            self._console.print(
+                f"[yellow]⚠ OpenRouter request failed ({exc}). "
                 f"Falling back to original text.[/yellow]"
             )
             return text
